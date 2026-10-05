@@ -40,7 +40,7 @@ sm.active(1)
 ar = array.array("I", [0 for _ in range(NUM_LEDS)])
 
 
-async def pixels_show():
+def pixels_show():
     dimmer_ar = array.array("I", [0 for _ in range(NUM_LEDS)])
     for i,c in enumerate(ar):
         r = (c >> 8) & 0xFF
@@ -48,7 +48,6 @@ async def pixels_show():
         b = c & 0xFF
         dimmer_ar[i] = (g<<16) + (r<<8) + b
     sm.put(dimmer_ar, 8)
-    await uasyncio.sleep_ms(10)
 
 
 def pixels_set(i, color):
