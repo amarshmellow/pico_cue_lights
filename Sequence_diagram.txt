@@ -1,0 +1,33 @@
+title Pico cue lights diagram
+
+participant Base board
+participant External board
+
+entryspacing 1.4
+Base board->External board:Initial button given to check if user is there
+
+note over External board:Light goes red
+
+External board->Base board: Give red light back as acknowledgement\n                   of connection status
+
+note over Base board:Light goes red
+
+######
+
+Base board->External board: Second button press given to check if user is ready
+
+note over External board:Light goes yellow
+
+External board->Base board: Give yellow light back as acknowledgement \n                   of user being ready
+
+note over Base board:Light goes yellow
+
+######
+
+Base board->External board: Final button press given to check if user is ready to go on stage
+
+note over External board:Light goes green
+
+External board->Base board:              Give green light back as acknowledgement                
+
+note over Base board:Light goes green
