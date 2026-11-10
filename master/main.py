@@ -13,6 +13,7 @@ MAGIC_SLAVE = 0x53    # marks slave packets
 TARGET_BIT = {"pico-1": 0, "pico-2": 1}   # which bit each slave reads
 BUTTON_PIN = {"pico-1": 1, "pico-2": 2}   # master button for each slave
 RESET_PIN = 3                              # master reset button
+GO_PIN = 4                                 # master all-go button
 
 onboard_led = Pin("LED", Pin.OUT)
 buttons = {n: Pin(p, Pin.IN, Pin.PULL_UP) for n, p in BUTTON_PIN.items()}
@@ -20,6 +21,9 @@ btn_last = {n: buttons[n].value() for n in buttons}
 reset_btn = Pin(RESET_PIN, Pin.IN, Pin.PULL_UP)
 reset_last = reset_btn.value()
 reset_count = 0          # incremented on each reset press, wraps at 256
+go_btn = Pin(GO_PIN, Pin.IN, Pin.PULL_UP)
+go_last = go_btn.value()
+go_count = 0             # incremented on each all-go press, wraps at 256
 btn_bits = 0             # bit set = that slave's button is pressed
 adv_bits = None          # bits currently being advertised
 slave_pressed = {}       # slave name -> bool, from scan results
@@ -39,14 +43,14 @@ def fields(payload):
 
 def build_adv(bits):
     flags = bytes([2, 0x01, 0x06])
-    # length 6: type 0xFF, company ID 0xFFFF, magic, bits, reset counter
-    mfr = bytes([6, 0xFF, 0xFF, 0xFF, MAGIC_MASTER, bits, reset_count])
+    # length 7: type 0xFF, company ID 0xFFFF, magic, bits, reset counter, go counter
+    mfr = bytes([7, 0xFF, 0xFF, 0xFF, MAGIC_MASTER, bits, reset_count, go_count])
     return flags + mfr
 
 def set_adv(bits):
     ble.gap_advertise(None)
     ble.gap_advertise(100_000, adv_data=build_adv(bits))
-    dbg("advertising bits", bin(bits), "reset", reset_count)
+    dbg("advertising bits", bin(bits), "reset", reset_count, "go", go_count)
 
 def irq(event, data):
     if event == 5:
@@ -62,7 +66,7 @@ def irq(event, data):
             slave_pressed[name] = bool(state)
 
 def tick():
-    global btn_bits, adv_bits, reset_last, reset_count
+    global btn_bits, adv_bits, reset_last, reset_count, go_last, go_count
     # Read each master button, debounce, and update the bit for its slave
     for name, pin in buttons.items():
         cur = pin.value()
@@ -92,6 +96,19 @@ def tick():
                 adv_bits = btn_bits
                 set_adv(adv_bits)
                 dbg("reset pressed, counter", reset_count)
+
+    # All-go button: each press bumps the go counter
+    cur = go_btn.value()
+    if cur != go_last:
+        time.sleep_ms(30)
+        cur = go_btn.value()
+        if cur != go_last:
+            go_last = cur
+            if cur == 0:
+                go_count = (go_count + 1) & 0xFF
+                adv_bits = btn_bits
+                set_adv(adv_bits)
+                dbg("all-go pressed, counter", go_count)
 
     # Print slave button changes
     for name, pressed in slave_pressed.items():

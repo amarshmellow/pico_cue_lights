@@ -28,6 +28,8 @@ ble.active(True)
 master_bit = None     # set by IRQ from master's advertisement
 master_reset = None   # reset counter from master's advertisement
 last_reset = None     # last counter value acted on
+master_go = None      # go counter from master's advertisement
+last_go = None        # last go counter value acted on
 phase = WAITING
 
 def fields(payload):
@@ -52,7 +54,7 @@ def set_adv(state):
     ble.gap_advertise(100_000, adv_data=build_adv(state))
 
 def irq(event, data):
-    global master_bit, master_reset
+    global master_bit, master_reset, master_go
     if event == 5:
         addr_type, addr, adv_type, rssi, adv_data = data
         for t, d in fields(adv_data):
@@ -60,6 +62,8 @@ def irq(event, data):
                 master_bit = (d[3] >> MY_BIT) & 1
                 if len(d) >= 5:
                     master_reset = d[4]
+                if len(d) >= 6:
+                    master_go = d[5]
 
 def show_phase(state):
     if state == RED:
@@ -103,6 +107,14 @@ while True:
         if last_reset is not None and current_reset != last_reset:
             reset_phase()
         last_reset = current_reset
+
+    # All go: a YELLOW slave moves to GREEN when the go counter changes
+    current_go = master_go
+    if current_go is not None:
+        if last_go is not None and current_go != last_go and phase == YELLOW:
+            advance(GREEN)
+            dbg("all go received")
+        last_go = current_go
 
     # The first master press starts the exchange; the next one completes it.
     current_master_bit = master_bit
