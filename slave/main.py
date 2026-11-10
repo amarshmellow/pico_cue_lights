@@ -16,12 +16,17 @@ MY_BIT = 0        # pico-1 -> 0, pico-2 -> 1
 MAGIC_MASTER = 0x4D
 MAGIC_SLAVE = 0x53
 
+WAITING = 0
+RED = 1
+YELLOW = 2
+GREEN = 3
+
 button = Pin(0, Pin.IN, Pin.PULL_UP)
 ble = bluetooth.BLE()
 ble.active(True)
 
 master_bit = None    # set by IRQ from master's advertisement
-shown_bit = None     # what the LED currently shows
+phase = WAITING
 
 def fields(payload):
     i = 0
@@ -52,34 +57,53 @@ def irq(event, data):
             if t == 0xFF and len(d) >= 4 and d[:2] == b"\xff\xff" and d[2] == MAGIC_MASTER:
                 master_bit = (d[3] >> MY_BIT) & 1
 
-def show(bit):
-    colour = (0, 255, 0) if bit else (0, 0, 0)
+def show_phase(state):
+    if state == RED:
+        colour = (0, 255, 0)
+    elif state == YELLOW:
+        colour = (100, 255, 0)
+    elif state == GREEN:
+        colour = (255, 0, 0)
+    else:
+        colour = (0, 0, 0)
     ws2812.pixels_fill(colour)
     ws2812.pixels_show()
 
+def advance(next_phase):
+    global phase
+    phase = next_phase
+    show_phase(phase)
+    set_adv(phase)
+    dbg("phase", phase)
+
 ble.irq(irq)
-set_adv(0)
+set_adv(WAITING)
 ble.gap_scan(0, 30000, 30000)   # continuous scan for the master
-show(0)
+show_phase(WAITING)
 dbg("advertising as", NAME)
 
-last = button.value()
-state = 0
+last_button = button.value()
+button_down = last_button == 0
+last_master_bit = 0
 while True:
-    # Apply LED from the master's latest state
-    if master_bit is not None and master_bit != shown_bit:
-        shown_bit = master_bit
-        show(shown_bit)
-        dbg("LED", "on" if shown_bit else "off")
+    # The first master press starts the exchange; the next one completes it.
+    current_master_bit = master_bit
+    if current_master_bit is not None and current_master_bit != last_master_bit:
+        last_master_bit = current_master_bit
+        if current_master_bit == 1 and phase == YELLOW:
+            advance(GREEN)
+        elif current_master_bit == 1 and phase == WAITING:
+            advance(RED)
 
-    # Read local button, debounce, update advertised state
+    # The slave's button confirms readiness after the red acknowledgement.
     cur = button.value()
-    if cur != last:
+    if cur != last_button:
         time.sleep_ms(30)
         cur = button.value()
-        if cur != last:
-            last = cur
-            state = 1 if cur == 0 else 0
-            set_adv(state)
-            dbg("button", "down" if state else "up", "advertising")
+        if cur != last_button:
+            last_button = cur
+            is_down = cur == 0
+            if is_down and not button_down and phase == RED:
+                advance(YELLOW)
+            button_down = is_down
     time.sleep_ms(20)
