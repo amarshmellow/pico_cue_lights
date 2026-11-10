@@ -12,10 +12,14 @@ MAGIC_MASTER = 0x4D   # marks master packets
 MAGIC_SLAVE = 0x53    # marks slave packets
 TARGET_BIT = {"pico-1": 0, "pico-2": 1}   # which bit each slave reads
 BUTTON_PIN = {"pico-1": 1, "pico-2": 2}   # master button for each slave
+RESET_PIN = 3                              # master reset button
 
 onboard_led = Pin("LED", Pin.OUT)
 buttons = {n: Pin(p, Pin.IN, Pin.PULL_UP) for n, p in BUTTON_PIN.items()}
 btn_last = {n: buttons[n].value() for n in buttons}
+reset_btn = Pin(RESET_PIN, Pin.IN, Pin.PULL_UP)
+reset_last = reset_btn.value()
+reset_count = 0          # incremented on each reset press, wraps at 256
 btn_bits = 0             # bit set = that slave's button is pressed
 adv_bits = None          # bits currently being advertised
 slave_pressed = {}       # slave name -> bool, from scan results
@@ -35,14 +39,14 @@ def fields(payload):
 
 def build_adv(bits):
     flags = bytes([2, 0x01, 0x06])
-    # length 5: type 0xFF, company ID 0xFFFF (test value), magic, bits
-    mfr = bytes([5, 0xFF, 0xFF, 0xFF, MAGIC_MASTER, bits])
+    # length 6: type 0xFF, company ID 0xFFFF, magic, bits, reset counter
+    mfr = bytes([6, 0xFF, 0xFF, 0xFF, MAGIC_MASTER, bits, reset_count])
     return flags + mfr
 
 def set_adv(bits):
     ble.gap_advertise(None)
     ble.gap_advertise(100_000, adv_data=build_adv(bits))
-    dbg("advertising bits", bin(bits))
+    dbg("advertising bits", bin(bits), "reset", reset_count)
 
 def irq(event, data):
     if event == 5:
@@ -58,7 +62,7 @@ def irq(event, data):
             slave_pressed[name] = bool(state)
 
 def tick():
-    global btn_bits, adv_bits
+    global btn_bits, adv_bits, reset_last, reset_count
     # Read each master button, debounce, and update the bit for its slave
     for name, pin in buttons.items():
         cur = pin.value()
@@ -75,6 +79,20 @@ def tick():
     if btn_bits != adv_bits:
         adv_bits = btn_bits
         set_adv(adv_bits)
+
+    # Reset button: each press bumps the counter, which the slaves act on
+    cur = reset_btn.value()
+    if cur != reset_last:
+        time.sleep_ms(30)
+        cur = reset_btn.value()
+        if cur != reset_last:
+            reset_last = cur
+            if cur == 0:
+                reset_count = (reset_count + 1) & 0xFF
+                adv_bits = btn_bits
+                set_adv(adv_bits)
+                dbg("reset pressed, counter", reset_count)
+
     # Print slave button changes
     for name, pressed in slave_pressed.items():
         if slave_printed.get(name) != pressed:

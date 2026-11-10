@@ -25,7 +25,9 @@ button = Pin(0, Pin.IN, Pin.PULL_UP)
 ble = bluetooth.BLE()
 ble.active(True)
 
-master_bit = None    # set by IRQ from master's advertisement
+master_bit = None     # set by IRQ from master's advertisement
+master_reset = None   # reset counter from master's advertisement
+last_reset = None     # last counter value acted on
 phase = WAITING
 
 def fields(payload):
@@ -50,12 +52,14 @@ def set_adv(state):
     ble.gap_advertise(100_000, adv_data=build_adv(state))
 
 def irq(event, data):
-    global master_bit
+    global master_bit, master_reset
     if event == 5:
         addr_type, addr, adv_type, rssi, adv_data = data
         for t, d in fields(adv_data):
             if t == 0xFF and len(d) >= 4 and d[:2] == b"\xff\xff" and d[2] == MAGIC_MASTER:
                 master_bit = (d[3] >> MY_BIT) & 1
+                if len(d) >= 5:
+                    master_reset = d[4]
 
 def show_phase(state):
     if state == RED:
@@ -76,6 +80,13 @@ def advance(next_phase):
     set_adv(phase)
     dbg("phase", phase)
 
+def reset_phase():
+    global phase
+    phase = WAITING
+    show_phase(phase)
+    set_adv(phase)   # advertise the reset so the master sees it
+    dbg("Reset phase to 0 (WAITING)")
+
 ble.irq(irq)
 set_adv(WAITING)
 ble.gap_scan(0, 30000, 30000)   # continuous scan for the master
@@ -86,8 +97,16 @@ last_button = button.value()
 button_down = last_button == 0
 last_master_bit = 0
 while True:
+    # Master reset: act only when the counter changes, not on first sight
+    current_reset = master_reset
+    if current_reset is not None:
+        if last_reset is not None and current_reset != last_reset:
+            reset_phase()
+        last_reset = current_reset
+
     # The first master press starts the exchange; the next one completes it.
     current_master_bit = master_bit
+
     if current_master_bit is not None and current_master_bit != last_master_bit:
         last_master_bit = current_master_bit
         if current_master_bit == 1 and phase == YELLOW:
@@ -97,6 +116,7 @@ while True:
 
     # The slave's button confirms readiness after the red acknowledgement.
     cur = button.value()
+
     if cur != last_button:
         time.sleep_ms(30)
         cur = button.value()
