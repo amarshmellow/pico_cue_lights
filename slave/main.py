@@ -9,6 +9,7 @@ def dbg(*args):
     if DEBUG:
         print("[S]", *args)
 
+# TODO: make this configurable via JSON file
 NAME = "pico-1"   # pico-2 on the second slave
 MY_BIT = 0        # pico-1 -> 0, pico-2 -> 1
 
