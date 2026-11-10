@@ -1,200 +1,93 @@
-import time
 import bluetooth
+import time
 from machine import Pin
-from micropython import const
-from ble_advertising import advertising_payload
 
-try:
-    import ws2812  # Optional: only the board with the LED strip has this
-except ImportError:
-    ws2812 = None
+DEBUG = True
 
-# ---- Pins ----
-BUTTON_PIN = 1
-button = Pin(BUTTON_PIN, Pin.IN, Pin.PULL_UP)
-toggle_led = Pin("LED", Pin.OUT)
+def dbg(*args):
+    if DEBUG:
+        print("[M]", *args)
 
-for _ in range(3):
-    toggle_led.value(1)
-    time.sleep(0.1)
-    toggle_led.value(0)
-    time.sleep(0.1)
+MAGIC_MASTER = 0x4D   # marks master packets
+MAGIC_SLAVE = 0x53    # marks slave packets
+TARGET_BIT = {"pico-1": 0, "pico-2": 1}   # which bit each slave reads
+BUTTON_PIN = {"pico-1": 1, "pico-2": 2}   # master button for each slave
 
-# ---- BLE constants ----
-_IRQ_CENTRAL_CONNECT = const(1)
-_IRQ_CENTRAL_DISCONNECT = const(2)
-_IRQ_GATTS_WRITE = const(3)
-_IRQ_SCAN_RESULT = const(5)
-_IRQ_PERIPHERAL_CONNECT = const(7)
-_IRQ_PERIPHERAL_DISCONNECT = const(8)
-_IRQ_GATTC_CHARACTERISTIC_RESULT = const(11)
-_IRQ_GATTC_CHARACTERISTIC_DONE = const(12)
-_IRQ_GATTC_NOTIFY = const(18)
+onboard_led = Pin("LED", Pin.OUT)
+buttons = {n: Pin(p, Pin.IN, Pin.PULL_UP) for n, p in BUTTON_PIN.items()}
+btn_last = {n: buttons[n].value() for n in buttons}
+btn_bits = 0             # bit set = that slave's button is pressed
+adv_bits = None          # bits currently being advertised
+slave_pressed = {}       # slave name -> bool, from scan results
+slave_printed = {}       # for printing changes only
 
-_FLAG_READ = const(0x0002)
-_FLAG_WRITE = const(0x0008)
-_FLAG_NOTIFY = const(0x0010)
+ble = bluetooth.BLE()
+ble.active(True)
 
-DEVICE_NAME = "REMOTE_BUTTON"
-_SERVICE_UUID = bluetooth.UUID(0x1815)
-_CHAR_UUID = bluetooth.UUID(0x2A56)
-_CHAR = (_CHAR_UUID, _FLAG_READ | _FLAG_WRITE | _FLAG_NOTIFY)
-_SERVICE = (_SERVICE_UUID, (_CHAR,))
-
-
-def get_name(adv_data):
-    adv = bytes(adv_data)
+def fields(payload):
     i = 0
-    while i < len(adv):
-        length = adv[i]
+    while i < len(payload):
+        length = payload[i]
         if length == 0:
             break
-        if adv[i + 1] == 0x09:  # Complete local name
-            try:
-                return adv[i + 2:i + 1 + length].decode()
-            except ValueError:
-                return None
+        yield payload[i + 1], bytes(payload[i + 2:i + 1 + length])
         i += 1 + length
-    return None
 
+def build_adv(bits):
+    flags = bytes([2, 0x01, 0x06])
+    # length 5: type 0xFF, company ID 0xFFFF (test value), magic, bits
+    mfr = bytes([5, 0xFF, 0xFF, 0xFF, MAGIC_MASTER, bits])
+    return flags + mfr
 
-class TwoWayBLE:
-    def __init__(self):
-        self.ble = bluetooth.BLE()
-        self.ble.active(True)
-        self.ble.irq(self.irq)
-        ((self.handle,),) = self.ble.gatts_register_services((_SERVICE,))
+def set_adv(bits):
+    ble.gap_advertise(None)
+    ble.gap_advertise(100_000, adv_data=build_adv(bits))
+    dbg("advertising bits", bin(bits))
 
-        self.my_addr = self.ble.config("mac")[1]  # Used to decide who connects
-        self.conn_handle = None
-        self.role = None                 # "central" or "peripheral"
-        self.peer_value_handle = None    # Only used when we are central
-        self.connecting = False
-        self.led_state = 0
+def irq(event, data):
+    if event == 5:
+        addr_type, addr, adv_type, rssi, adv_data = data
+        name = None
+        state = None
+        for t, d in fields(adv_data):
+            if t == 0x09:
+                name = d.decode("utf-8", "ignore")
+            elif t == 0xFF and len(d) >= 4 and d[:2] == b"\xff\xff" and d[2] == MAGIC_SLAVE:
+                state = d[3]
+        if name in TARGET_BIT and state is not None:
+            slave_pressed[name] = bool(state)
 
-        self.start_discovery()
+def tick():
+    global btn_bits, adv_bits
+    # Read each master button, debounce, and update the bit for its slave
+    for name, pin in buttons.items():
+        cur = pin.value()
+        if cur != btn_last[name]:
+            time.sleep_ms(30)
+            cur = pin.value()
+            if cur != btn_last[name]:
+                btn_last[name] = cur
+                bit = 1 << TARGET_BIT[name]
+                if cur == 0:
+                    btn_bits |= bit
+                else:
+                    btn_bits &= ~bit
+    if btn_bits != adv_bits:
+        adv_bits = btn_bits
+        set_adv(adv_bits)
+    # Print slave button changes
+    for name, pressed in slave_pressed.items():
+        if slave_printed.get(name) != pressed:
+            slave_printed[name] = pressed
+            dbg(name, "button", "down" if pressed else "up")
+    # Onboard LED: on if any slave button is pressed
+    onboard_led.value(1 if any(slave_pressed.values()) else 0)
 
-    # ---- Discovery ----
-    def start_discovery(self):
-        self.connecting = False
-        self.ble.gap_advertise(
-            100000,
-            adv_data=advertising_payload(name=DEVICE_NAME, services=[_SERVICE_UUID]),
-        )
-        self.ble.gap_scan(0, 30000, 30000)  # 0 = scan until stopped
-        print("Advertising and scanning for", DEVICE_NAME)
-
-    def stop_discovery(self):
-        self.ble.gap_scan(None)
-        self.ble.gap_advertise(None)
-
-    # ---- IRQ handler ----
-    def irq(self, event, data):
-        if event == _IRQ_SCAN_RESULT:
-            addr_type, addr, _, _, adv_data = data
-            if self.conn_handle is not None or self.connecting:
-                return
-            if get_name(adv_data) != DEVICE_NAME:
-                return
-            addr = bytes(addr)
-            # Tie-break: only the board with the lower address connects,
-            # so both boards don't try to connect to each other at once.
-            if self.my_addr < addr:
-                self.connecting = True
-                self.ble.gap_scan(None)
-                self.ble.gap_connect(addr_type, addr)
-                print("Found peer - connecting...")
-
-        elif event == _IRQ_CENTRAL_CONNECT:
-            # Another board connected to us: we are the peripheral
-            self.conn_handle, _, _ = data
-            self.role = "peripheral"
-            self.stop_discovery()
-            print("Connected (peripheral)")
-
-        elif event == _IRQ_PERIPHERAL_CONNECT:
-            # We connected to another board: we are the central
-            self.conn_handle, _, _ = data
-            self.role = "central"
-            self.stop_discovery()
-            print("Connected (central) - discovering...")
-            self.ble.gattc_discover_characteristics(self.conn_handle, 1, 65535)
-
-        elif event in (_IRQ_CENTRAL_DISCONNECT, _IRQ_PERIPHERAL_DISCONNECT):
-            print("Disconnected - restarting discovery")
-            self.conn_handle = None
-            self.role = None
-            self.peer_value_handle = None
-            self.start_discovery()
-
-        # ---- Central-side events ----
-        elif event == _IRQ_GATTC_CHARACTERISTIC_RESULT:
-            _, _, value_handle, _, uuid = data
-            if uuid == _CHAR_UUID:
-                self.peer_value_handle = value_handle
-
-        elif event == _IRQ_GATTC_CHARACTERISTIC_DONE:
-            if self.peer_value_handle is not None:
-                # Subscribe to notifications (CCCD is right after the value handle)
-                self.ble.gattc_write(self.conn_handle, self.peer_value_handle + 1, b"\x01\x00", 1)
-                print("Subscribed to peer notifications")
-            else:
-                print("Warning: peer characteristic not found")
-
-        elif event == _IRQ_GATTC_NOTIFY:
-            _, _, notify_data = data
-            self._handle_incoming(notify_data)
-
-        # ---- Peripheral-side events ----
-        elif event == _IRQ_GATTS_WRITE:
-            _, value_handle = data
-            if value_handle == self.handle:  # Ignore the CCCD subscribe write
-                self._handle_incoming(self.ble.gatts_read(self.handle))
-
-    # ---- Receiving ----
-    def _handle_incoming(self, raw):
-        try:
-            state = int(bytes(raw).decode())
-        except ValueError:
-            print("Bad data:", raw)
-            return
-        print("Received state:", state)
-        self.set_state(state)
-
-    # ---- Sending ----
-    def send(self, value):
-        if self.conn_handle is None:
-            print("Not connected - not sent")
-            return
-        payload = str(value).encode()
-        if self.role == "central":
-            if self.peer_value_handle is not None:
-                self.ble.gattc_write(self.conn_handle, self.peer_value_handle, payload, 1)
-        else:
-            self.ble.gatts_notify(self.conn_handle, self.handle, payload)
-
-    # ---- LED handling ----
-    def set_state(self, state):
-        self.led_state = state
-        toggle_led.value(state)
-        if ws2812:
-            if state:
-                ws2812.pixels_fill([0, 0, 0])   # Same mapping as the original receiver
-            else:
-                ws2812.pixels_fill([16, 16, 16])
-            ws2812.pixels_show()
-
-
-bt = TwoWayBLE()
-last_pressed = False
-print("Ready")
+ble.irq(irq)
+set_adv(0)
+ble.gap_scan(0, 30000, 30000)   # 0 = scan continuously
+dbg("running")
 
 while True:
-    pressed = button.value() == 0
-    if pressed and not last_pressed:
-        new_state = 1 - bt.led_state
-        bt.set_state(new_state)
-        bt.send(new_state)
-        print("Button pressed - sent state:", new_state)
-    last_pressed = pressed
-    time.sleep(0.05)
+    tick()
+    time.sleep_ms(20)
