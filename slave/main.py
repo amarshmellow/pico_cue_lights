@@ -1,5 +1,6 @@
 import bluetooth
 import time
+import utime
 from machine import Pin
 import ws2812
 
@@ -23,6 +24,10 @@ RED = 1
 YELLOW = 2
 GREEN = 3
 
+# Green flash timing
+GREEN_FLASH_MS = 3000      # flash for this long after green is given, then solid
+FLASH_INTERVAL_MS = 100   # time each flash stays on or off
+
 # Hardware
 ble = bluetooth.BLE()
 ble.active(True)
@@ -36,6 +41,12 @@ last_go = None                # last go counter acted on
 last_press = None             # last press counter for this slave acted on
 button_last = button.value()
 button_down = button_last == 0
+
+# Green flash state
+green_start = None            # time green was given (ms)
+green_solid = False           # True once the flash period has finished
+flash_on = False
+last_flash = 0
 
 
 def fields(payload):
@@ -104,10 +115,39 @@ def show_phase(state):
     ws2812.pixels_show()
 
 
+def start_green_flash():
+    """Called when green is given: LED starts on and flashes for GREEN_FLASH_MS."""
+    global green_start, green_solid, flash_on, last_flash
+    now = utime.ticks_ms()
+    green_start = now
+    green_solid = False
+    flash_on = True
+    last_flash = now
+
+
+def update_green_flash():
+    """Flash the green LED, then hold it solid once the flash period has passed."""
+    global green_solid, flash_on, last_flash
+    if phase != GREEN or green_solid:
+        return
+    now = utime.ticks_ms()
+    if utime.ticks_diff(now, green_start) >= GREEN_FLASH_MS:
+        green_solid = True
+        show_phase(GREEN)
+        dbg("green now solid")
+        return
+    if utime.ticks_diff(now, last_flash) >= FLASH_INTERVAL_MS:
+        last_flash = now
+        flash_on = not flash_on
+        show_phase(GREEN if flash_on else WAITING)
+
+
 def advance(next_phase):
     global phase
     phase = next_phase
     show_phase(phase)
+    if phase == GREEN:
+        start_green_flash()
     broadcast(bytes([MAGIC_SLAVE, phase]))
     dbg("phase", phase)
 
@@ -172,4 +212,5 @@ dbg("advertising as", NAME, "slot", MY_SLOT)
 while True:
     check_master()
     check_own_button()
+    update_green_flash()
     time.sleep_ms(20)
