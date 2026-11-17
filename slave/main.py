@@ -26,7 +26,7 @@ GREEN = 3
 
 # Green flash timing
 GREEN_FLASH_MS = 3000      # flash for this long after green is given, then solid
-FLASH_INTERVAL_MS = 100   # time each flash stays on or off
+FLASH_INTERVAL_MS = 250    # time each flash stays on or off
 
 # Hardware
 ble = bluetooth.BLE()
@@ -172,8 +172,8 @@ def check_master():
         reset_phase()
     last_reset = reset_count
 
-    # All go: a YELLOW slave moves to GREEN when the go counter changes
-    if last_go is not None and go_count != last_go and phase == YELLOW:
+    # All go: any slave not already GREEN goes to GREEN, whatever its phase
+    if last_go is not None and go_count != last_go and phase != GREEN:
         advance(GREEN)
         dbg("all go received")
     last_go = go_count
