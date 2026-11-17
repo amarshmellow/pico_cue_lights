@@ -16,7 +16,7 @@ MAGIC_MASTER = 0x4D   # first byte of every master message
 MAGIC_SLAVE = 0x53    # first byte of every slave message
 
 # Pins
-BUTTON_PIN = {"pico-1": 0, "pico-2": 1, "pico-3": 2, "pico-4": 3}   # one button per slave
+BUTTON_PIN = {"pico-1": 21, "pico-2": 21, "pico-3": 19, "pico-4": 18}   # one button per slave
 RESET_PIN = 16
 GO_PIN = 17
 
@@ -56,6 +56,8 @@ incoming = {}
 
 # What each LED currently shows
 shown_phase = {}
+
+onboard_led.value(1)
 
 
 def fields(payload):
@@ -128,7 +130,7 @@ def update_leds():
 
     # Onboard LED is on if any slave is past WAITING
     any_active = any(read_phase(name) != WAITING for name in SLAVES)
-    onboard_led.value(1 if any_active else 0)
+    #onboard_led.value(1 if any_active else 0)
 
 
 def check_slave_buttons():

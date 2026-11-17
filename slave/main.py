@@ -26,12 +26,13 @@ GREEN = 3
 
 # Green flash timing
 GREEN_FLASH_MS = 3000      # flash for this long after green is given, then solid
-FLASH_INTERVAL_MS = 250    # time each flash stays on or off
+FLASH_INTERVAL_MS = 100    # time each flash stays on or off
 
 # Hardware
 ble = bluetooth.BLE()
 ble.active(True)
 button = Pin(0, Pin.IN, Pin.PULL_UP)
+onboard_led = Pin("LED", Pin.OUT)
 
 # State
 phase = WAITING
@@ -41,6 +42,7 @@ last_go = None                # last go counter acted on
 last_press = None             # last press counter for this slave acted on
 button_last = button.value()
 button_down = button_last == 0
+onboard_led.value(1)
 
 # Green flash state
 green_start = None            # time green was given (ms)
