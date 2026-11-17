@@ -1,6 +1,7 @@
 import bluetooth
 import time
 from machine import Pin
+import ws2812
 
 DEBUG = True
 
@@ -8,31 +9,57 @@ def dbg(*args):
     if DEBUG:
         print("[M]", *args)
 
-MAGIC_MASTER = 0x4D   # marks master packets
-MAGIC_SLAVE = 0x53    # marks slave packets
-TARGET_BIT = {"pico-1": 0, "pico-2": 1}   # which bit each slave reads
-BUTTON_PIN = {"pico-1": 1, "pico-2": 2}   # master button for each slave
-RESET_PIN = 3                              # master reset button
-GO_PIN = 4                                 # master all-go button
+# Board names and message markers
+MASTER_NAME = "master"
+SLAVES = ["pico-1", "pico-2", "pico-3", "pico-4"]
+MAGIC_MASTER = 0x4D   # first byte of every master message
+MAGIC_SLAVE = 0x53    # first byte of every slave message
 
-onboard_led = Pin("LED", Pin.OUT)
-buttons = {n: Pin(p, Pin.IN, Pin.PULL_UP) for n, p in BUTTON_PIN.items()}
-btn_last = {n: buttons[n].value() for n in buttons}
-reset_btn = Pin(RESET_PIN, Pin.IN, Pin.PULL_UP)
-reset_last = reset_btn.value()
-reset_count = 0          # incremented on each reset press, wraps at 256
-go_btn = Pin(GO_PIN, Pin.IN, Pin.PULL_UP)
-go_last = go_btn.value()
-go_count = 0             # incremented on each all-go press, wraps at 256
-btn_bits = 0             # bit set = that slave's button is pressed
-adv_bits = None          # bits currently being advertised
-slave_pressed = {}       # slave name -> bool, from scan results
-slave_printed = {}       # for printing changes only
+# Pins
+BUTTON_PIN = {"pico-1": 0, "pico-2": 1, "pico-3": 2, "pico-4": 3}   # one button per slave
+RESET_PIN = 16
+GO_PIN = 17
 
+# Phases and their LED colours (in the byte order ws2812 expects)
+WAITING = 0
+RED = 1
+YELLOW = 2
+GREEN = 3
+COLOURS = {
+    WAITING: (0, 0, 0),
+    RED: (0, 255, 0),
+    YELLOW: (100, 255, 0),
+    GREEN: (255, 0, 0),
+}
+
+# Hardware
 ble = bluetooth.BLE()
 ble.active(True)
+onboard_led = Pin("LED", Pin.OUT)
+
+buttons = {name: Pin(pin, Pin.IN, Pin.PULL_UP) for name, pin in BUTTON_PIN.items()}
+button_last = {name: buttons[name].value() for name in SLAVES}
+
+reset_btn = Pin(RESET_PIN, Pin.IN, Pin.PULL_UP)
+reset_last = reset_btn.value()
+
+go_btn = Pin(GO_PIN, Pin.IN, Pin.PULL_UP)
+go_last = go_btn.value()
+
+# Values this master broadcasts
+press_count = [0] * len(SLAVES)   # one per slave, wraps at 256
+reset_count = 0
+go_count = 0
+
+# Latest message heard from each board, keyed by name
+incoming = {}
+
+# What each LED currently shows
+shown_phase = {}
+
 
 def fields(payload):
+    """Split raw advertisement data into (type, data) pairs."""
     i = 0
     while i < len(payload):
         length = payload[i]
@@ -41,50 +68,86 @@ def fields(payload):
         yield payload[i + 1], bytes(payload[i + 2:i + 1 + length])
         i += 1 + length
 
-def build_adv(bits):
-    flags = bytes([2, 0x01, 0x06])
-    # length 7: type 0xFF, company ID 0xFFFF, magic, bits, reset counter, go counter
-    mfr = bytes([7, 0xFF, 0xFF, 0xFF, MAGIC_MASTER, bits, reset_count, go_count])
-    return flags + mfr
 
-def set_adv(bits):
+def broadcast(message):
+    """Advertise a message (bytes) so the slaves can read it."""
+    name_b = MASTER_NAME.encode()
+    flags = bytes([2, 0x01, 0x06])
+    name_field = bytes([len(name_b) + 1, 0x09]) + name_b
+    # manufacturer data: type 0xFF, company 0xFFFF, then the message
+    mfr = bytes([len(message) + 3, 0xFF, 0xFF, 0xFF]) + message
     ble.gap_advertise(None)
-    ble.gap_advertise(100_000, adv_data=build_adv(bits))
-    dbg("advertising bits", bin(bits), "reset", reset_count, "go", go_count)
+    ble.gap_advertise(100_000, adv_data=flags + name_field + mfr)
+
+
+def receive(name):
+    """Return the latest message heard from a board, or None."""
+    return incoming.get(name)
+
 
 def irq(event, data):
-    if event == 5:
-        addr_type, addr, adv_type, rssi, adv_data = data
-        name = None
-        state = None
-        for t, d in fields(adv_data):
-            if t == 0x09:
-                name = d.decode("utf-8", "ignore")
-            elif t == 0xFF and len(d) >= 4 and d[:2] == b"\xff\xff" and d[2] == MAGIC_SLAVE:
-                state = d[3]
-        if name in TARGET_BIT and state is not None:
-            slave_pressed[name] = bool(state)
+    if event != 5:
+        return
+    addr_type, addr, adv_type, rssi, adv_data = data
+    name = None
+    message = None
+    for t, d in fields(adv_data):
+        if t == 0x09:
+            name = d.decode("utf-8", "ignore")
+        elif t == 0xFF and d[:2] == b"\xff\xff":
+            message = bytes(d[2:])
+    if name is not None and message is not None:
+        incoming[name] = message
 
-def tick():
-    global btn_bits, adv_bits, reset_last, reset_count, go_last, go_count
-    # Read each master button, debounce, and update the bit for its slave
-    for name, pin in buttons.items():
-        cur = pin.value()
-        if cur != btn_last[name]:
+
+def read_phase(name):
+    """The phase a slave last reported, or WAITING if we haven't heard it."""
+    message = receive(name)
+    if message is not None and message[0] == MAGIC_SLAVE:
+        return message[1]
+    return WAITING
+
+
+def send_state():
+    """Build the master message from the current counters and broadcast it."""
+    broadcast(bytes([MAGIC_MASTER, reset_count, go_count] + press_count))
+    dbg("sent presses", press_count, "reset", reset_count, "go", go_count)
+
+
+def update_leds():
+    changed = False
+    for index, name in enumerate(SLAVES):
+        phase = read_phase(name)
+        if shown_phase.get(name) != phase:
+            shown_phase[name] = phase
+            ws2812.pixels_set(index, COLOURS[phase])
+            changed = True
+            dbg(name, "phase", phase)
+    if changed:
+        ws2812.pixels_show()
+
+    # Onboard LED is on if any slave is past WAITING
+    any_active = any(read_phase(name) != WAITING for name in SLAVES)
+    onboard_led.value(1 if any_active else 0)
+
+
+def check_slave_buttons():
+    global press_count
+    for index, name in enumerate(SLAVES):
+        cur = buttons[name].value()
+        if cur != button_last[name]:
             time.sleep_ms(30)
-            cur = pin.value()
-            if cur != btn_last[name]:
-                btn_last[name] = cur
-                bit = 1 << TARGET_BIT[name]
-                if cur == 0:
-                    btn_bits |= bit
-                else:
-                    btn_bits &= ~bit
-    if btn_bits != adv_bits:
-        adv_bits = btn_bits
-        set_adv(adv_bits)
+            cur = buttons[name].value()
+            if cur != button_last[name]:
+                button_last[name] = cur
+                if cur == 0:   # pressed
+                    press_count[index] = (press_count[index] + 1) & 0xFF
+                    send_state()
+                    dbg(name, "pressed, count", press_count[index])
 
-    # Reset button: each press bumps the counter, which the slaves act on
+
+def check_reset_button():
+    global reset_last, reset_count
     cur = reset_btn.value()
     if cur != reset_last:
         time.sleep_ms(30)
@@ -93,11 +156,12 @@ def tick():
             reset_last = cur
             if cur == 0:
                 reset_count = (reset_count + 1) & 0xFF
-                adv_bits = btn_bits
-                set_adv(adv_bits)
+                send_state()
                 dbg("reset pressed, counter", reset_count)
 
-    # All-go button: each press bumps the go counter
+
+def check_go_button():
+    global go_last, go_count
     cur = go_btn.value()
     if cur != go_last:
         time.sleep_ms(30)
@@ -106,23 +170,20 @@ def tick():
             go_last = cur
             if cur == 0:
                 go_count = (go_count + 1) & 0xFF
-                adv_bits = btn_bits
-                set_adv(adv_bits)
+                send_state()
                 dbg("all-go pressed, counter", go_count)
 
-    # Print slave button changes
-    for name, pressed in slave_pressed.items():
-        if slave_printed.get(name) != pressed:
-            slave_printed[name] = pressed
-            dbg(name, "button", "down" if pressed else "up")
-    # Onboard LED: on if any slave button is pressed
-    onboard_led.value(1 if any(slave_pressed.values()) else 0)
 
 ble.irq(irq)
-set_adv(0)
+send_state()
+ws2812.pixels_fill(COLOURS[WAITING])
+ws2812.pixels_show()
 ble.gap_scan(0, 30000, 30000)   # 0 = scan continuously
 dbg("running")
 
 while True:
-    tick()
+    check_slave_buttons()
+    check_reset_button()
+    check_go_button()
+    update_leds()
     time.sleep_ms(20)

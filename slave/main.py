@@ -9,30 +9,37 @@ def dbg(*args):
     if DEBUG:
         print("[S]", *args)
 
-# TODO: make this configurable via JSON file
-NAME = "pico-1"   # pico-2 on the second slave
-MY_BIT = 0        # pico-1 -> 0, pico-2 -> 1
+# Change these for each slave board
+NAME = "pico-1"       # must match the master's SLAVES list
+MY_SLOT = 0           # pico-1 -> 0, pico-2 -> 1, pico-3 -> 2, pico-4 -> 3
+MASTER_NAME = "master"
 
-MAGIC_MASTER = 0x4D
-MAGIC_SLAVE = 0x53
+MAGIC_MASTER = 0x4D   # first byte of every master message
+MAGIC_SLAVE = 0x53    # first byte of every slave message
 
+# Phases
 WAITING = 0
 RED = 1
 YELLOW = 2
 GREEN = 3
 
-button = Pin(0, Pin.IN, Pin.PULL_UP)
+# Hardware
 ble = bluetooth.BLE()
 ble.active(True)
+button = Pin(0, Pin.IN, Pin.PULL_UP)
 
-master_bit = None     # set by IRQ from master's advertisement
-master_reset = None   # reset counter from master's advertisement
-last_reset = None     # last counter value acted on
-master_go = None      # go counter from master's advertisement
-last_go = None        # last go counter value acted on
+# State
 phase = WAITING
+incoming = {}                 # latest message heard from each board, keyed by name
+last_reset = None             # last reset counter acted on
+last_go = None                # last go counter acted on
+last_press = None             # last press counter for this slave acted on
+button_last = button.value()
+button_down = button_last == 0
+
 
 def fields(payload):
+    """Split raw advertisement data into (type, data) pairs."""
     i = 0
     while i < len(payload):
         length = payload[i]
@@ -41,29 +48,48 @@ def fields(payload):
         yield payload[i + 1], bytes(payload[i + 2:i + 1 + length])
         i += 1 + length
 
-def build_adv(state):
+
+def broadcast(message):
+    """Advertise a message (bytes) so the master can read it."""
     name_b = NAME.encode()
     flags = bytes([2, 0x01, 0x06])
     name_field = bytes([len(name_b) + 1, 0x09]) + name_b
-    # length 5: type 0xFF, company ID 0xFFFF (test value), magic, state
-    mfr = bytes([5, 0xFF, 0xFF, 0xFF, MAGIC_SLAVE, state])
-    return flags + name_field + mfr
-
-def set_adv(state):
+    # manufacturer data: type 0xFF, company 0xFFFF, then the message
+    mfr = bytes([len(message) + 3, 0xFF, 0xFF, 0xFF]) + message
     ble.gap_advertise(None)
-    ble.gap_advertise(100_000, adv_data=build_adv(state))
+    ble.gap_advertise(100_000, adv_data=flags + name_field + mfr)
+
+
+def receive(name):
+    """Return the latest message heard from a board, or None."""
+    return incoming.get(name)
+
 
 def irq(event, data):
-    global master_bit, master_reset, master_go
-    if event == 5:
-        addr_type, addr, adv_type, rssi, adv_data = data
-        for t, d in fields(adv_data):
-            if t == 0xFF and len(d) >= 4 and d[:2] == b"\xff\xff" and d[2] == MAGIC_MASTER:
-                master_bit = (d[3] >> MY_BIT) & 1
-                if len(d) >= 5:
-                    master_reset = d[4]
-                if len(d) >= 6:
-                    master_go = d[5]
+    if event != 5:
+        return
+    addr_type, addr, adv_type, rssi, adv_data = data
+    name = None
+    message = None
+    for t, d in fields(adv_data):
+        if t == 0x09:
+            name = d.decode("utf-8", "ignore")
+        elif t == 0xFF and d[:2] == b"\xff\xff":
+            message = bytes(d[2:])
+    if name is not None and message is not None:
+        incoming[name] = message
+
+
+def read_master():
+    """Return (reset, go, press) from the master, or None if not heard yet."""
+    message = receive(MASTER_NAME)
+    if message is None or message[0] != MAGIC_MASTER:
+        return None
+    reset_count = message[1]
+    go_count = message[2]
+    press_count = message[3 + MY_SLOT]   # this slave's own press counter
+    return reset_count, go_count, press_count
+
 
 def show_phase(state):
     if state == RED:
@@ -77,65 +103,73 @@ def show_phase(state):
     ws2812.pixels_fill(colour)
     ws2812.pixels_show()
 
+
 def advance(next_phase):
     global phase
     phase = next_phase
     show_phase(phase)
-    set_adv(phase)
+    broadcast(bytes([MAGIC_SLAVE, phase]))
     dbg("phase", phase)
+
 
 def reset_phase():
     global phase
     phase = WAITING
     show_phase(phase)
-    set_adv(phase)   # advertise the reset so the master sees it
-    dbg("Reset phase to 0 (WAITING)")
+    broadcast(bytes([MAGIC_SLAVE, phase]))   # tell the master we've reset
+    dbg("reset phase to 0 (WAITING)")
 
-ble.irq(irq)
-set_adv(WAITING)
-ble.gap_scan(0, 30000, 30000)   # continuous scan for the master
-show_phase(WAITING)
-dbg("advertising as", NAME)
 
-last_button = button.value()
-button_down = last_button == 0
-last_master_bit = 0
-while True:
+def check_master():
+    global last_reset, last_go, last_press
+    master = read_master()
+    if master is None:
+        return
+    reset_count, go_count, press_count = master
+
     # Master reset: act only when the counter changes, not on first sight
-    current_reset = master_reset
-    if current_reset is not None:
-        if last_reset is not None and current_reset != last_reset:
-            reset_phase()
-        last_reset = current_reset
+    if last_reset is not None and reset_count != last_reset:
+        reset_phase()
+    last_reset = reset_count
 
     # All go: a YELLOW slave moves to GREEN when the go counter changes
-    current_go = master_go
-    if current_go is not None:
-        if last_go is not None and current_go != last_go and phase == YELLOW:
-            advance(GREEN)
-            dbg("all go received")
-        last_go = current_go
+    if last_go is not None and go_count != last_go and phase == YELLOW:
+        advance(GREEN)
+        dbg("all go received")
+    last_go = go_count
 
-    # The first master press starts the exchange; the next one completes it.
-    current_master_bit = master_bit
-
-    if current_master_bit is not None and current_master_bit != last_master_bit:
-        last_master_bit = current_master_bit
-        if current_master_bit == 1 and phase == YELLOW:
-            advance(GREEN)
-        elif current_master_bit == 1 and phase == WAITING:
+    # Master button for this slave: WAITING -> RED, then YELLOW -> GREEN
+    if last_press is not None and press_count != last_press:
+        if phase == WAITING:
             advance(RED)
+        elif phase == YELLOW:
+            advance(GREEN)
+        dbg("master press", press_count)
+    last_press = press_count
 
-    # The slave's button confirms readiness after the red acknowledgement.
+
+def check_own_button():
+    global button_last, button_down
     cur = button.value()
-
-    if cur != last_button:
+    if cur != button_last:
         time.sleep_ms(30)
         cur = button.value()
-        if cur != last_button:
-            last_button = cur
+        if cur != button_last:
+            button_last = cur
             is_down = cur == 0
+            # Slave's own button confirms readiness after red: RED -> YELLOW
             if is_down and not button_down and phase == RED:
                 advance(YELLOW)
             button_down = is_down
+
+
+ble.irq(irq)
+broadcast(bytes([MAGIC_SLAVE, WAITING]))
+ble.gap_scan(0, 30000, 30000)   # continuous scan for the master
+show_phase(WAITING)
+dbg("advertising as", NAME, "slot", MY_SLOT)
+
+while True:
+    check_master()
+    check_own_button()
     time.sleep_ms(20)
