@@ -175,7 +175,7 @@ def check_master():
     last_reset = reset_count
 
     # All go: any slave not already GREEN goes to GREEN, whatever its phase
-    if last_go is not None and go_count != last_go and phase != GREEN:
+    if last_go is not None and go_count != last_go and phase in (RED,YELLOW):
         advance(GREEN)
         dbg("all go received")
     last_go = go_count
